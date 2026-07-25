@@ -1,0 +1,1 @@
+export type NodeState = 'FOLLOWER' | 'CANDIDATE' | 'LEADER';
