@@ -18,6 +18,7 @@ export interface RaftNodeConfig {
   heartbeatInterval: number;
 
   transport: RaftTransport;
+  onApply?: (index: number, command: string) => void;
 }
 
 export class RaftNode {
@@ -30,6 +31,7 @@ export class RaftNode {
   readonly heartbeatInterval: number;
 
   private readonly transport: RaftTransport;
+  private readonly onApply: ((index: number, command: string) => void) | undefined;
 
   private state: NodeState = "FOLLOWER";
   private currentTerm: number = 0;
@@ -53,6 +55,7 @@ export class RaftNode {
     this.maxElectionTimeout = config.maxElectionTimeout;
     this.heartbeatInterval = config.heartbeatInterval;
     this.transport = config.transport;
+    this.onApply = config.onApply;
   }
 
   private getClusterSize(): number {
@@ -110,6 +113,41 @@ export class RaftNode {
     this.startElectionTimer();
   }
 
+  stop() {
+    this.stopElectionTimer();
+    this.stopHeartbeatTimer();
+  }
+
+  getStatus() {
+    return {
+      id: this.id,
+      state: this.state,
+      term: this.currentTerm,
+      votedFor: this.votedFor,
+      logLength: this.log.length,
+      commitIndex: this.commitIndex,
+      lastApplied: this.lastApplied,
+    };
+  }
+
+  propose(command: string): { success: boolean; index?: number } {
+    if (this.state !== "LEADER") {
+      return { success: false };
+    }
+
+    const entry: LogEntry = {
+      term: this.currentTerm,
+      command,
+    };
+
+    this.log.push(entry);
+    const index = this.log.length - 1;
+
+    this.replicateLog();
+
+    return { success: true, index };
+  }
+
   private getLastLogIndex(): number {
     return this.log.length - 1;
   }
@@ -129,6 +167,40 @@ export class RaftNode {
     const myLastIndex = this.getLastLogIndex();
     if (lastLogTerm !== myLastTerm) return lastLogTerm > myLastTerm;
     return lastLogIndex >= myLastIndex;
+  }
+
+  private applyCommittedEntries() {
+    while (this.lastApplied < this.commitIndex) {
+      this.lastApplied++;
+      const entry = this.log[this.lastApplied];
+      if (entry && this.onApply) {
+        this.onApply(this.lastApplied, entry.command);
+      }
+    }
+  }
+
+  private advanceCommitIndex() {
+    if (this.state !== "LEADER") return;
+
+    for (let n = this.log.length - 1; n > this.commitIndex; n--) {
+      if (this.log[n]!.term !== this.currentTerm) {
+        continue;
+      }
+
+      let replicatedCount = 1;
+      for (const peer of this.peers) {
+        const matchIdx = this.matchIndex.get(peer) ?? -1;
+        if (matchIdx >= n) {
+          replicatedCount++;
+        }
+      }
+
+      if (replicatedCount >= this.getQuorum()) {
+        this.commitIndex = n;
+        this.applyCommittedEntries();
+        break;
+      }
+    }
   }
 
   private startElection() {
@@ -207,7 +279,7 @@ export class RaftNode {
     this.startHeartbeatTimer();
   }
 
-  private sendHeartbeat() {
+  private replicateLog() {
     if (this.state !== "LEADER") return;
 
     const currentTerm = this.currentTerm;
@@ -216,13 +288,14 @@ export class RaftNode {
       const nextIdx = this.nextIndex.get(peer) ?? 0;
       const prevLogIndex = nextIdx - 1;
       const prevLogTerm = this.getLogTerm(prevLogIndex);
+      const entries = this.log.slice(nextIdx);
 
       const request: AppendEntriesRequest = {
         term: currentTerm,
         leaderId: this.id,
         prevLogIndex,
         prevLogTerm,
-        entries: [],
+        entries,
         leaderCommit: this.commitIndex,
       };
 
@@ -232,9 +305,13 @@ export class RaftNode {
           this.handleAppendEntriesResponse(peer, currentTerm, request, response);
         })
         .catch(() => {
-          // Network failure
+          // Network failure — will retry on next heartbeat
         });
     }
+  }
+
+  private sendHeartbeat() {
+    this.replicateLog();
   }
 
   private handleAppendEntriesResponse(
@@ -256,6 +333,7 @@ export class RaftNode {
       const newMatchIndex = request.prevLogIndex + request.entries.length;
       this.matchIndex.set(peer, newMatchIndex);
       this.nextIndex.set(peer, newMatchIndex + 1);
+      this.advanceCommitIndex();
     } else {
       const currentNextIndex = this.nextIndex.get(peer) ?? 0;
       if (currentNextIndex > 0) {
@@ -328,6 +406,7 @@ export class RaftNode {
     if (request.leaderCommit > this.commitIndex) {
       const lastNewEntryIndex = request.prevLogIndex + request.entries.length;
       this.commitIndex = Math.min(request.leaderCommit, lastNewEntryIndex);
+      this.applyCommittedEntries();
     }
 
     return { term: this.currentTerm, success: true };
